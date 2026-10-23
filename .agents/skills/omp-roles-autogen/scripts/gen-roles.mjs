@@ -37,18 +37,30 @@ const DOMESTIC_CREATORS = new Set([
 const SCORE_WEIGHT = 40;
 const COST_FLOOR = 0.05;
 
-const AGENT_DIR = process.env.OMP_AGENT_DIR ?? path.join(os.homedir(), '.omp', 'agent');
-const CONFIG_PATH = path.join(AGENT_DIR, 'config.yml');
-const MODELS_YML = path.join(AGENT_DIR, 'models.yml');
+/** omp 的 agent 目录：OMP_AGENT_DIR（脚本自己的强制覆盖）→ `omp config path`（认 --profile / OMP_PROFILE /
+ *  PI_CODING_AGENT_DIR，唯一权威来源）→ ~/.omp/agent。不能靠环境变量猜：profile 目录是
+ *  ~/.omp/profiles/<name>/agent，猜错就会把配置写进别的 profile。 */
+function resolveAgentDir() {
+  if (process.env.OMP_AGENT_DIR) return process.env.OMP_AGENT_DIR;
+  const bins = process.platform === 'win32' ? ['omp', 'omp.cmd'] : ['omp'];
+  for (const bin of bins) {
+    const r = spawnSync(bin, ['config', 'path'], { encoding: 'utf8' });
+    const out = (r.stdout ?? '').trim();
+    if (r.status === 0 && out) return out;
+  }
+  return path.join(os.homedir(), '.omp', 'agent');
+}
+
+let CONFIGURED_PROVIDERS = new Set();
 
 /** models.yml 里显式配置的 provider（有 baseUrl/apiKey）—— 只有它们保证真的能调通。
  *  内置 provider（如官方 `deepseek/`）也会出现在 `omp models --json` 里，但没配 key 时调用必失败，
  *  所以同名多行时优先用户自己配的 provider。 */
-function readConfiguredProviders() {
+function readConfiguredProviders(modelsYml) {
   const names = new Set();
   let lines;
   try {
-    lines = readFileSync(MODELS_YML, 'utf8').split(/\r?\n/);
+    lines = readFileSync(modelsYml, 'utf8').split(/\r?\n/);
   } catch {
     return names;
   }
@@ -64,7 +76,6 @@ function readConfiguredProviders() {
   return names;
 }
 
-const CONFIGURED_PROVIDERS = readConfiguredProviders();
 const providerOf = (selector) => selector.split('/')[0];
 /** creator 名归一化：大小写不敏感，连字符/下划线等同空格（`z-ai` 匹配 AA 的 `Z AI`） */
 const normCreator = (s) => String(s).toLowerCase().replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -258,7 +269,7 @@ function pickRow(rows) {
   })[0];
 }
 
-function matchCatalog(base, models, skipped) {
+function matchCatalog(base, models, skipped, speed) {
   const lower = base.toLowerCase();
   const exact = models.filter((m) => String(m.name ?? '').toLowerCase() === lower);
   if (exact.length) return { row: pickRow(exact), how: 'exact' };
@@ -267,6 +278,7 @@ function matchCatalog(base, models, skipped) {
   if (selectors.size === 1) return { row: pickRow(loose), how: 'contains' };
   skipped.push({
     aaName: base,
+    speedNum: speed,
     reason: selectors.size === 0 ? 'no catalog match' : `ambiguous: ${[...selectors].join(', ')}`,
   });
   return null;
@@ -300,10 +312,9 @@ function buildPool(opts, dataDir, models) {
     if (opts.domestic && !DOMESTIC_CREATORS.has(normCreator(creator))) continue;
     if (excluded.has(normCreator(creator))) continue;
     const speed = speedNum(row.speed);
-    if (opts.minSpeed > 0 && speed < opts.minSpeed) continue;
 
     const base = baseName(row.model);
-    const hit = matchCatalog(base, models, skipped);
+    const hit = matchCatalog(base, models, skipped, speed);
     if (!hit) continue;
     const m = hit.row;
     const ds = dsBest.get(normalizeSlug(base));
@@ -331,7 +342,10 @@ function buildPool(opts, dataDir, models) {
       }
     }
   }
-  return { pool: [...bySelector.values()], skipped, unconfigured: unconfigured.keys() };
+  const all = [...bySelector.values()];
+  // --min-speed 只筛角色候选池：审查子代理是低频只读任务，速度不是约束。
+  const pool = opts.minSpeed > 0 ? all.filter((c) => c.speedNum >= opts.minSpeed) : all;
+  return { pool, reviewPool: all, skipped, unconfigured: unconfigured.keys() };
 }
 
 const cmpScore = (a, b) =>
@@ -429,6 +443,40 @@ function resolveRoles(ranked) {
   return { roles, chains };
 }
 
+// 审查子代理（task.agentModelOverrides）：只读、低频，速度不重要；关键是
+//   ① 不与写码模型（default）同厂 —— 否则审查方共享实现方的盲区；
+//   ② 两个审查员彼此不同厂 —— 两个视角才不是同一个；
+//   ③ 优先有 DeepSWE 实测的（长程工具操作最接近 review），AA index 次之。
+const REVIEW_AGENTS = ['reviewer', 'security-reviewer'];
+
+function resolveReviewAgents(reviewPool, roles) {
+  const writer = roles.default?.cand ?? null;
+  const writerCreator = writer ? normCreator(writer.creator) : null;
+  const dsRanked = reviewPool
+    .filter((c) => c.dsPass != null)
+    .sort((a, b) => b.dsPass - a.dsPass || b.index - a.index || a.dsCost - b.dsCost || cmpScore(a, b));
+  const foreign = (avoid) => dsRanked.find((c) => !avoid.has(normCreator(c.creator))) ?? null;
+
+  const reviewer = (writerCreator ? foreign(new Set([writerCreator])) : dsRanked[0]) ??
+    dsRanked[0] ??
+    roles.slow?.cand ??
+    roles.default?.cand ??
+    null;
+  const reviewerCreator = reviewer ? normCreator(reviewer.creator) : null;
+  const security = (reviewerCreator
+    ? foreign(new Set([reviewerCreator, writerCreator].filter(Boolean)))
+    : null) ??
+    (reviewerCreator ? foreign(new Set([reviewerCreator])) : null) ??
+    reviewer;
+
+  const out = {};
+  for (const agent of REVIEW_AGENTS) {
+    const cand = agent === 'reviewer' ? reviewer : security;
+    out[agent] = cand ? { cand, value: fmt(cand, tierOf(cand, 'highest')) } : null;
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- YAML 读写
 
 const TOP_KEY = /^[A-Za-z0-9_.-]+:/;
@@ -476,6 +524,13 @@ function presetLines(name) {
   return out;
 }
 
+/** task.agentModelOverrides 子块；两个审查员都没解出来时返回空数组（不动现有配置） */
+function overrideLines() {
+  const names = REVIEW_AGENTS.filter((a) => review[a]?.value);
+  if (!names.length) return [];
+  return ['  agentModelOverrides:', ...names.map((a) => `    ${a}: ${review[a].value}`)];
+}
+
 function replaceBlock(lines, block, replacement) {
   lines.splice(block.start, block.end - block.start, ...replacement);
 }
@@ -504,7 +559,29 @@ function applyConfig(originalLines, presetName) {
     lines.push('retry:', ...chainsNew);
   }
 
-  // 3) modelPresets.<preset> 子块（按名字典序插入，保持输出稳定）
+  // 3) task.agentModelOverrides 子块：只重写 reviewer / security-reviewer 两行，
+  //    其它 agent（sonic、task、自定义名…）与 task 下其它键一律保留。
+  const overridesNew = overrideLines();
+  if (overridesNew.length) {
+    const taskBlock = findTopBlock(lines, 'task');
+    if (taskBlock) {
+      const sub = findChildBlock(lines, taskBlock, 'agentModelOverrides', 2);
+      if (sub) {
+        const managed = new Set(REVIEW_AGENTS);
+        const foreign = lines.slice(sub.start + 1, sub.end).filter((l) => {
+          const m = /^ {4}([^:#]+):/.exec(l);
+          return !m || !managed.has(m[1].trim());
+        });
+        replaceBlock(lines, sub, [overridesNew[0], ...foreign, ...overridesNew.slice(1)]);
+      } else {
+        lines.splice(taskBlock.start + 1, 0, ...overridesNew);
+      }
+    } else {
+      lines.push('task:', ...overridesNew);
+    }
+  }
+
+  // 4) modelPresets.<preset> 子块（按名字典序插入，保持输出稳定）
   const presetNew = presetLines(presetName);
   const presetBlock = findTopBlock(lines, 'modelPresets');
   if (presetBlock) {
@@ -541,6 +618,9 @@ function validate(originalLines, nextLines) {
   }
   const dupes = after.filter((k, i) => after.indexOf(k) !== i);
   if (dupes.length) problems.push(`duplicate top-level keys: ${[...new Set(dupes)].join(', ')}`);
+  if (REVIEW_AGENTS.some((a) => review[a]?.value) && !nextLines.some((l) => l.trimEnd() === '  agentModelOverrides:')) {
+    problems.push('task.agentModelOverrides block was not written');
+  }
   return problems;
 }
 
@@ -567,10 +647,26 @@ function report(roles, chains, skipped, opts) {
   console.log(widths.map((w) => '-'.repeat(w)).join('  '));
   for (const d of data) console.log(line(d));
 
+  // 审查子代理（task.agentModelOverrides）
+  const reviewNames = REVIEW_AGENTS.filter((a) => review[a]?.value);
+  console.log('\nreview agents (task.agentModelOverrides):');
+  if (!reviewNames.length) {
+    console.log('  (none resolved — existing overrides left untouched)');
+  } else {
+    for (const a of reviewNames) {
+      const c = review[a].cand;
+      const speed = Number.isFinite(c.speedNum) ? `${c.speedNum} tok/s` : '--';
+      console.log(`  ${a}: ${review[a].value}  (AA ${c.index}, $${c.cost}, ${speed}, DS ${c.dsPass == null ? '-' : `${c.dsPass}%`})`);
+    }
+  }
+
   const unresolved = rows.filter((r) => !roles[r].value);
-  if (skipped.length) {
+  // 只列「本来会进候选池」的行：速度低于下限的行已经因速度出局，再列匹配失败只是噪音。
+  const visibleSkipped = skipped.filter((s) => opts.minSpeed <= 0 || s.speedNum >= opts.minSpeed)
+    .filter((s, i, arr) => arr.findIndex((t) => t.aaName === s.aaName && t.reason === s.reason) === i);
+  if (visibleSkipped.length) {
     console.log('\nskipped AA rows (no unique catalog match):');
-    for (const s of skipped) console.log(`  - ${s.aaName}  →  ${s.reason}`);
+    for (const s of visibleSkipped) console.log(`  - ${s.aaName}  →  ${s.reason}`);
   }
   if (unresolved.length) {
     console.log(`\nUNRESOLVED roles (no candidate survived the filters): ${unresolved.join(', ')}`);
@@ -588,9 +684,10 @@ const modelsPath = opts.out ? path.resolve(opts.out) : path.join(dataDir, 'omp-m
 
 ensureLeaderboardData(dataDir, opts.dryRun);
 const models = loadModels(modelsPath, opts.dryRun);
-const { pool, skipped, unconfigured } = buildPool(opts, dataDir, models);
+const { pool, reviewPool, skipped, unconfigured } = buildPool(opts, dataDir, models);
 const ranked = [...pool].sort(cmpScore);
 const { roles, chains } = resolveRoles(ranked);
+const review = resolveReviewAgents(reviewPool, roles);
 
 report(roles, chains, skipped, opts);
 if (CONFIGURED_PROVIDERS.size) {
@@ -599,7 +696,9 @@ if (CONFIGURED_PROVIDERS.size) {
   }
 }
 
-const configPath = CONFIG_PATH;
+const agentDir = resolveAgentDir();
+CONFIGURED_PROVIDERS = readConfiguredProviders(path.join(agentDir, 'models.yml'));
+const configPath = path.join(agentDir, 'config.yml');
 
 const raw = existsSync(configPath) ? readFileSync(configPath, 'utf8') : '';
 const eol = raw.includes('\r\n') ? '\r\n' : '\n';
@@ -621,6 +720,8 @@ if (opts.dryRun) {
   console.log(['modelRoles:', ...roleLines(2)].join(eol));
   console.log('\n[dry-run] would replace `retry.fallbackChains:` with:');
   console.log(chainLines().length ? chainLines().join(eol) : '(removed — no chains selected)');
+  console.log('\n[dry-run] would replace `task.agentModelOverrides:` with:');
+  console.log(overrideLines().length ? overrideLines().join(eol) : '(skipped — no review agent resolved)');
   console.log(`\n[dry-run] would add/replace preset \`${opts.preset}\` with:`);
   console.log(presetLines(opts.preset).join(eol));
   console.log('\n[dry-run] nothing written.');

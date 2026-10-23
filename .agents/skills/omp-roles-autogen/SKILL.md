@@ -7,9 +7,14 @@ description: "Use when the user asks to auto-configure omp model roles, regenera
 
 一条命令把「模型斩杀线」的数据（Artificial Analysis Intelligence Index +
 DeepSWE PASS@1）和本机 `omp models --json` 目录对齐，按固定规则给 omp 的
-11 个 Chat 角色各选一个模型，生成三块配置写进全局 `config.yml`：
-`modelRoles`、`retry.fallbackChains`、`modelPresets`（快照，不动用户已用的
-默认配置——`modelPresets` 只增不删）。
+11 个 Chat 角色各选一个模型，并单独给审查子代理
+（`task.agentModelOverrides` 的 `reviewer` / `security-reviewer`）选模型，
+生成配置写进全局 `config.yml`：`modelRoles`、`retry.fallbackChains`、
+`modelPresets`（快照，不动用户已用的默认配置——`modelPresets` 只增不删）、
+`task.agentModelOverrides`（保留 `task` 下其它键）。
+
+审查子代理不跟 `task` 的吞吐模型走：它们只读、低频，要求的是「与写码模型不同厂」
+（否则审查方共享实现方的盲区）和「两个审查员彼此不同厂」，速度不作约束。
 
 选型全部由脚本定案（纯规则，无需 LLM 判断），stdout 永远打印逐角色依据表，
 用户想换取向就调参数重跑，而不是手改 YAML。
@@ -35,14 +40,15 @@ node .agents/skills/omp-roles-autogen/scripts/gen-roles.mjs \
 |---|---|
 | `--domestic` | 只在国产 creator 里选（DeepSeek / Alibaba / Z AI / Kimi / MiniMax / StepFun / Xiaomi / Tencent …） |
 | `--exclude <a,b,...>` | 排除 creator，大小写不敏感，可重复出现（`--exclude xiaomi --exclude kimi` 等价于逗号写法） |
-| `--min-speed <tok/s>` | AA 中位输出速度下限（默认 0＝不过滤；AA 显示 `--` 的行按 `-Infinity`，任何 >0 的下限都会过滤掉它） |
+|`--min-speed <tok/s>`|AA 中位输出速度下限（默认 0＝不过滤；AA 显示 `--` 的行按 `-Infinity`，任何 >0 的下限都会过滤掉它）。**只筛角色候选池，不筛审查子代理**|
 | `--preset <name>` | `modelPresets` 里的快照名，默认 `autogen-YYYYMMDD`（当天重跑＝覆盖同名快照，幂等） |
 | `--dry-run` | 不写任何文件，打印将替换/新增的块全文 |
 | `--dir <path>` | 榜单数据目录（默认 `os.tmpdir()/model-killing-line`） |
 | `--out <path>` | `omp models --json` 缓存文件（默认 `<dir>/omp-models.json`） |
 
-配置目标：`$OMP_AGENT_DIR/config.yml`，未设 `OMP_AGENT_DIR` 时为
-`~/.omp/agent/config.yml`。`--profile` 场景需自己把 `OMP_AGENT_DIR` 指到该 profile。
+配置目标：脚本按 `omp config path` 定位当前 agent 目录（认 `--profile` / `OMP_PROFILE` /
+`PI_CODING_AGENT_DIR`），未设 profile 时就是 `~/.omp/agent/config.yml`；
+`OMP_AGENT_DIR` 可强制覆盖（仅本脚本用，omp 本身不认）。
 
 ## 选型规则（写死在脚本里，改规则改脚本）
 
@@ -62,15 +68,22 @@ node .agents/skills/omp-roles-autogen/scripts/gen-roles.mjs \
   最高 score，其次全池非自身最高 score；都选不出来就不写该角色的链。
 - 同一模型在 AA 有多个 effort 变体（`GLM-5.3 (max)` / `(low)`）时按 selector 去重，
   保留 index 最高的一行。
+- 审查子代理（`task.agentModelOverrides`）：候选池＝同一批 AA 行但**不过 `--min-speed`**
+  （速度与 review 无关）。`reviewer` 取 DeepSWE PASS@1 最高且 creator ≠ `default` 的模型
+  （同分比 AA index，再比 DS 成本）；`security-reviewer` 再排除 `reviewer` 的 creator
+  （优先也排除 `default` 的），没有 DeepSWE 实测的全不选。两个都解不出来时**不改动**
+  现有的 `agentModelOverrides` 块；thinking 取各模型最高档。
 
 ## 输出与写入
 
 1. stdout：`角色 | selector | AA index | AA cost | tok/s | DS pass | 规则命中` 表 +
-   skipped（AA 行匹配不到目录模型）名单 + `UNRESOLVED`（池空导致无解）角色。
+   `review agents` 两行（reviewer / security-reviewer 及其 AA/成本/速度/DS）+ skipped
+   （AA 行匹配不到目录模型）名单 + `UNRESOLVED`（池空导致无解）角色。
    **把这份表转述给用户**，并说明可调参数（`--domestic` / `--exclude` / `--min-speed` / `--preset`）。
 2. `config.yml`：只重写 `modelRoles:` 整块、`retry:` 下的 `fallbackChains:` 子块、
-   `modelPresets:` 下同名快照；其余键（缩进、注释、顺序）逐字保留。写回前按顶层键粗
-   解析校验（原有顶层键一个不能少、目标三块都在），校验失败不落盘并退出 1。
+   `task.agentModelOverrides:` 里 **reviewer / security-reviewer 两行**（其它 agent 键如
+   `sonic`、`task` 原样保留）、`modelPresets:` 下同名快照；其余键（缩进、注释、顺序）逐字保留。
+   写回前按顶层键粗解析校验（原有顶层键一个不能少、目标块都在），校验失败不落盘并退出 1。
    选中的模型若来自 `models.yml` 没配的 provider（内置 provider、没 key），stderr 打 warning。
 3. `--dry-run` 只打印「将替换 / 将新增」的块全文。
 
@@ -78,8 +91,10 @@ node .agents/skills/omp-roles-autogen/scripts/gen-roles.mjs \
 
 - stdout 的 11 角色表里没有 `UNRESOLVED`（除非候选池确实被参数筛空，此时脚本仍退出 0
   并在报告里明示）。
+- `review agents` 两行都有值，且两个审查员不同 creator、都不与 `default` 同 creator。
 - 真写之后 `omp config get modelRoles` / `omp config get retry.fallbackChains` /
-  `omp config get modelPresets` 都能解析，`modelPresets` 里用户原有快照仍在。
+  `omp config get modelPresets` / `omp config get task.agentModelOverrides` 都能解析，
+  `modelPresets` 里用户原有快照仍在。
 - 同参数再跑一次 `--dry-run`，diff 为空（幂等）。
 
 ## 注意
